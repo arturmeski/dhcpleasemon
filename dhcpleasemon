@@ -1,0 +1,190 @@
+#!/usr/bin/env python3
+
+DHCP_LEASE_DIR = "/var/db/dhcpleased"
+TRIGGER_SCRIPTS_DIR = "/etc/dhcpleasemon"
+ROOTDIR = "/"
+
+import os, sys
+from time import sleep
+import subprocess
+from daemonize import Daemonize
+from argparse import ArgumentParser
+
+
+class LeaseMonitor:
+
+    def __init__(self, interfaces, scripts_dir, dhcp_lease_dir):
+        self.monitored_interfaces = interfaces
+        self.scripts_dir = scripts_dir
+        self.dhcp_lease_dir = dhcp_lease_dir
+        self.net_if_file_stat = {}
+        self.net_if_config = {}
+
+    def run_trigger_script(self, net_if, script_env):
+        """
+        Execute the trigger script
+        """
+        trigger_script_file = os.path.join(self.scripts_dir, f"lease_trigger_{net_if}")
+        if os.path.isfile(trigger_script_file) and os.access(
+            trigger_script_file, os.X_OK
+        ):
+            try:
+                subprocess.run(
+                    [trigger_script_file],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                    env=script_env,
+                )
+            except subprocess.CalledProcessError as e:
+                print(f'Failed to run trigger script for "{trigger_script_file}": {e}')
+
+    def get_default_route(self, net_if):
+        """
+        Extract the default route for the interface via netstat
+        """
+        try:
+            result = subprocess.run(
+                ["netstat", "-rn"], capture_output=True, text=True, check=True
+            )
+        except subprocess.CalledProcessError as e:
+            print(f"Error extracting routine via netstat: {e}")
+            return ""
+
+        for line in result.stdout.splitlines():
+            cols = line.split()
+            if len(cols) == 8:
+                dest, route_ip, *_, iface = cols
+                if iface == net_if:
+                    return route_ip
+
+        return ""
+
+    def get_lease_ip_addr(self, lease_file):
+        """
+        Read the IP address associated with the lease
+        """
+        with open(lease_file, "r") as f:
+            for line in f:
+                ident, value = line.split(":")
+                if ident.strip() == "ip":
+                    return value.strip()
+        return ""
+
+    def check(self):
+        """
+        Checks if the lease data has changed
+        and triggers the script execution
+        """
+
+        for net_if in self.monitored_interfaces:
+
+            lease_file = os.path.join(self.dhcp_lease_dir, net_if)
+            if os.path.exists(lease_file):
+
+                curr_stat_signature = self.net_if_file_stat.get(net_if, None)
+                new_stat = os.stat(lease_file)
+                new_stat_signature = new_stat.st_mtime, new_stat.st_ctime
+
+                if curr_stat_signature != new_stat_signature:
+                    self.net_if_file_stat[net_if] = new_stat_signature
+
+                    lease_ip_addr = self.get_lease_ip_addr(lease_file)
+                    lease_default_route = self.get_default_route(net_if)
+
+                    curr_addr_and_route = self.net_if_config.get(net_if, None)
+                    new_addr_and_route = (lease_ip_addr, lease_default_route)
+
+                    if curr_addr_and_route == new_addr_and_route:
+                        continue
+                    else:
+                        self.net_if_config[net_if] = new_addr_and_route
+
+                    if lease_ip_addr and lease_default_route:
+
+                        script_env = os.environ.copy()
+                        script_env["DHCP_IFACE"] = net_if
+                        script_env["DHCP_IP_ADDR"] = lease_ip_addr
+                        script_env["DHCP_IP_ROUTE"] = lease_default_route
+
+                        self.run_trigger_script(net_if, script_env)
+
+    def go(self):
+        """
+        The main loop
+        """
+        while True:
+            self.check()
+            sleep(1)
+
+
+def main():
+
+    parser = ArgumentParser()
+    parser.add_argument(
+        "--foreground", "-f", action="store_true", help="run in foreground"
+    )
+    parser.add_argument(
+        "--pid-file",
+        "-p",
+        action="store",
+        default="/var/run/dhcpleasemon.pid",
+        help="PID file",
+    )
+    parser.add_argument(
+        "--root-dir",
+        "-d",
+        action="store",
+        default=ROOTDIR,
+        help="root directory",
+    )
+    parser.add_argument(
+        "--scripts-dir",
+        "-s",
+        action="store",
+        default=TRIGGER_SCRIPTS_DIR,
+        help="directory with trigger scripts",
+    )
+    parser.add_argument(
+        "--dhcp-lease-dir",
+        "-L",
+        action="store",
+        default=DHCP_LEASE_DIR,
+        help="directory monitored for lease changes",
+    )
+    parser.add_argument(
+        "--interfaces",
+        "-I",
+        action="append",
+        default=None,
+        help="interfaces to monitor",
+    )
+    args = parser.parse_args()
+
+    if not args.interfaces:
+        print("No interfaces specified")
+        sys.exit(1)
+
+    lease_monitor = LeaseMonitor(
+        args.interfaces,
+        scripts_dir=args.scripts_dir,
+        dhcp_lease_dir=args.dhcp_lease_dir,
+    )
+
+    if not args.foreground:
+        daemon = Daemonize(
+            app="dhcpleasemon",
+            pid=args.pid_file,
+            chdir=args.root_dir,
+            action=lease_monitor.go,
+        )
+        daemon.start()
+
+    else:
+        os.chdir(args.root_dir)
+        lease_monitor.go()
+
+if __name__ == "__main__":
+    main()
+
+# EOF
