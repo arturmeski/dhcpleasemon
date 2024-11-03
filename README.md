@@ -2,9 +2,9 @@
 
 This is a daemon that monitors any lease changes for the specified
 interfaces. When a change happens it then calls a script located
-in /etc/dhcpleasemon. The script name should be
+in /etc/dhcpleasemon. The script name should be:
 
-    `lease_trigger_<interface>`
+    lease_trigger_<interface>
 
 The script has access to the following environment variables:
 
